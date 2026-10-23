@@ -1,16 +1,18 @@
 """
 Mail Feed collector - Kerem Demirbas
-Reads new Outlook mails (READ-ONLY) and writes them as plain text for Claude.
+Reads new Outlook mails (READ-ONLY) and writes them as plain text.
 It never sends, replies, moves, deletes or marks anything in Outlook.
+Afterwards it pushes the text feed to GitHub, where analyzer/ runs on it.
 
-Output (next to this script):
-  feed/YYYY-MM-DD/index.txt        one short line per mail
-  feed/YYYY-MM-DD/mails/0001.txt   clean mail text + attachment text
-  feed/YYYY-MM-DD/files/...        original attachments
-  state.json                       what was already collected
-  run_log.txt                      one line per run
+Output (repo root = folder above this script):
+  feed/YYYY-MM-DD/index.txt        one short line per mail      (pushed)
+  feed/YYYY-MM-DD/mails/0001.txt   clean mail text + attachment text (pushed)
+  feed/YYYY-MM-DD/files/...        original attachments          (local only)
+  collector/state.json             what was already collected    (local only)
+  collector/run_log.txt            one line per run              (local only)
 """
-import os, re, sys, json, hashlib, datetime as dt, traceback, zipfile
+import os, re, sys, json, hashlib, subprocess, urllib.request, urllib.error
+import datetime as dt, traceback, zipfile
 
 # ---------------- settings ----------------
 FOLDERS = ["Inbox", "Sent"]      # Inbox includes its subfolders
@@ -19,9 +21,11 @@ OVERLAP_DAYS = 2                 # re-check window (already-seen mails are skipp
 MAX_BODY = 15000                 # chars per mail body
 MAX_ATT = 12000                  # chars of text per attachment
 SKIP_SMALL_IMAGES = 30 * 1024    # logos / signatures
+PUSH_TO_GITHUB = True            # git push feed/ after collecting (private repo only)
 # -----------------------------------------
 
 BASE = os.path.dirname(os.path.abspath(__file__))
+ROOT = os.path.dirname(BASE)
 STATE = os.path.join(BASE, "state.json")
 LOG = os.path.join(BASE, "run_log.txt")
 IMG = {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".heic", ".webp"}
@@ -213,7 +217,7 @@ def main():
 
     found.sort(key=lambda x: x[0])
     day = now.strftime("%Y-%m-%d")
-    out = os.path.join(BASE, "feed", day)
+    out = os.path.join(ROOT, "feed", day)
     mdir, fdir = os.path.join(out, "mails"), os.path.join(out, "files")
     os.makedirs(mdir, exist_ok=True)
     os.makedirs(fdir, exist_ok=True)
@@ -294,6 +298,47 @@ def main():
     st["last_run"] = now.isoformat(timespec="seconds")
     save_state(st)
     log(f"OK  {len(found)} new mails -> feed/{day}")
+    if PUSH_TO_GITHUB:
+        log(push_feed(day, len(found)))
+
+
+# ---------- push to GitHub ----------
+def git(*args):
+    r = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=180,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if r.returncode != 0:
+        raise RuntimeError(f"git {args[0]}: {(r.stderr or r.stdout).strip()[-300:]}")
+    return r.stdout.strip()
+
+
+def repo_is_private():
+    """Unauthenticated API call: a public repo answers 200, a private one 404."""
+    url = git("remote", "get-url", "origin")
+    m = re.search(r"github\.com[:/]([^/]+)/([^/]+?)(\.git)?$", url)
+    if not m:
+        raise RuntimeError(f"origin is not a GitHub repo: {url}")
+    try:
+        urllib.request.urlopen(f"https://api.github.com/repos/{m[1]}/{m[2]}", timeout=20)
+        return False
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            return True
+        raise
+
+
+def push_feed(day, n):
+    try:
+        if not repo_is_private():
+            return "PUSH SKIPPED  repo is PUBLIC - make it private first (mails would be visible to everyone)"
+        git("add", "feed")
+        if git("diff", "--cached", "--name-only"):
+            git("commit", "-m", f"feed: {n} new mails ({day})")
+        # also retries an earlier commit whose push failed (offline etc.)
+        git("pull", "--rebase", "--autostash", "-q")
+        git("push", "-q")
+        return "PUSH  OK"
+    except Exception as e:
+        return f"PUSH FAILED  {e}"
 
 
 if __name__ == "__main__":

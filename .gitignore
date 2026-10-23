@@ -1,0 +1,7 @@
+# local-only collector data
+collector/state.json
+collector/state.json.tmp
+collector/run_log.txt
+# original attachments stay on the PC; their text is already inside mails/*.txt
+feed/*/files/
+__pycache__/

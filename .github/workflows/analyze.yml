@@ -1,0 +1,65 @@
+name: Analyze mails
+
+on:
+  push:
+    paths: ["feed/**"]          # the PC collector pushed new mails
+  workflow_dispatch:
+    inputs:
+      day:
+        description: "Only this day (YYYY-MM-DD), empty = all"
+        required: false
+      force:
+        description: "Re-analyse already analysed mails"
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: analyze-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Refuse to run on a public repo
+        if: ${{ !github.event.repository.private }}
+        run: |
+          echo "::error::Repo is public - mail reports would be visible to everyone. Make it private (Settings > General > Danger Zone)."
+          exit 1
+
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Analyze
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+          MAIL_OWNER: ${{ vars.MAIL_OWNER }}
+          DAY: ${{ inputs.day }}
+          FORCE: ${{ inputs.force }}
+        run: |
+          args=()
+          [ -n "$DAY" ] && args+=(--day "$DAY")
+          [ "$FORCE" = "true" ] && args+=(--force)
+          python analyzer/analyze.py "${args[@]}"
+
+      - name: Commit reports
+        if: ${{ !cancelled() && github.event.repository.private }}   # keep partial results even if some mails failed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          for p in reports DASHBOARD.md; do [ -e "$p" ] && git add "$p"; done
+          git diff --cached --quiet && exit 0
+          git commit -m "reports: $(date -u +%F)"
+          for i in 1 2 3; do
+            git pull --rebase -q origin "${GITHUB_REF_NAME}" && git push -q origin "HEAD:${GITHUB_REF_NAME}" && exit 0
+            sleep 5
+          done
+          exit 1
